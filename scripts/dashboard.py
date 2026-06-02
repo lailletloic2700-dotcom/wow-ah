@@ -1,16 +1,25 @@
-import streamlit as st
-import sqlite3
-import pandas as pd
-import subprocess
-import plotly.express as px
-
-DB_PATH = "data/ah.sqlite"
 import os
+import sys
+import subprocess
 
-st.write("Current folder:", os.getcwd())
-st.write("Files:", os.listdir("."))
-st.write("Data exists:", os.path.exists("data"))
-st.write("DB exists:", os.path.exists(DB_PATH))
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import psycopg2
+
+from dotenv import load_dotenv
+
+
+# =========================
+# ENV
+# =========================
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    st.error("DATABASE_URL missing")
+    st.stop()
 
 
 # =========================
@@ -25,6 +34,69 @@ st.title("📊 WoW AH Dashboard")
 
 
 # =========================
+# DB
+# =========================
+def get_conn():
+    return psycopg2.connect(DATABASE_URL)
+
+
+# =========================
+# LOAD ITEM NAMES
+# =========================
+@st.cache_data(ttl=3600)
+def load_item_names():
+
+    conn = get_conn()
+
+    df = pd.read_sql_query("""
+        SELECT item_id, name
+        FROM items
+    """, conn)
+
+    conn.close()
+
+    return dict(
+        zip(
+            df["item_id"],
+            df["name"]
+        )
+    )
+
+
+ITEM_NAMES = load_item_names()
+
+
+# =========================
+# MIDNIGHT RANK SYSTEM
+# =========================
+def get_item_name(item_id):
+
+    name = ITEM_NAMES.get(
+        item_id,
+        f"Item {item_id}"
+    )
+
+    if pd.isna(name):
+        name = f"Item {item_id}"
+
+    if (item_id - 1) in ITEM_NAMES:
+
+        prev_name = ITEM_NAMES[item_id - 1]
+
+        if prev_name == name:
+            return f"{name} (R2)"
+
+    if (item_id + 1) in ITEM_NAMES:
+
+        next_name = ITEM_NAMES[item_id + 1]
+
+        if next_name == name:
+            return f"{name} (R1)"
+
+    return str(name)
+
+
+# =========================
 # UPDATE BUTTON
 # =========================
 if st.button("🔄 Update AH Data"):
@@ -32,13 +104,15 @@ if st.button("🔄 Update AH Data"):
     with st.spinner("Updating Blizzard AH..."):
 
         subprocess.run(
-            ["py", "scripts/import_commodities.py"]
+            [
+                sys.executable,
+                "scripts/import_commodities_pg.py"
+            ]
         )
 
     st.cache_data.clear()
 
     st.success("AH Updated!")
-
 
 
 # =========================
@@ -47,22 +121,18 @@ if st.button("🔄 Update AH Data"):
 @st.cache_data(ttl=300)
 def load_realms():
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
 
-    query = """
+    df = pd.read_sql_query("""
         SELECT DISTINCT realm
-        FROM auctions
+        FROM current_auctions
         WHERE realm IS NOT NULL
         ORDER BY realm
-    """
-
-    df = pd.read_sql_query(query, conn)
+    """, conn)
 
     conn.close()
 
-    realms = df["realm"].dropna().tolist()
-
-    return realms
+    return df["realm"].dropna().tolist()
 
 
 # =========================
@@ -71,76 +141,60 @@ def load_realms():
 @st.cache_data(ttl=300)
 def load_items_for_realm(realm):
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
 
-    query = """
+    df = pd.read_sql_query("""
         SELECT DISTINCT
-            a.item_id,
-            i.name
-        FROM auctions a
-
-        LEFT JOIN items i
-        ON a.item_id = i.item_id
-
-        WHERE a.realm = ?
-        AND i.name IS NOT NULL
-    """
-
-    df = pd.read_sql_query(
-        query,
-        conn,
-        params=(realm,)
-    )
+            item_id
+        FROM current_auctions
+        WHERE realm = %s
+        ORDER BY item_id
+    """, conn, params=(realm,))
 
     conn.close()
 
-    names = []
+    if df.empty:
+        return df
 
-    for _, row in df.iterrows():
+    df["display_name"] = df["item_id"].apply(
+        get_item_name
+    )
 
-        item_name = str(row["name"])
+    df = df.dropna(
+        subset=["display_name"]
+    )
 
-        item_id = row["item_id"]
+    df["display_name"] = df[
+        "display_name"
+    ].astype(str)
 
-        names.append(
-            f"{item_name}"
-        )
+    df = df.sort_values(
+        "display_name"
+    )
 
-    names = sorted(list(set(names)))
-
-    return names
+    return df
 
 
 # =========================
-# LOAD AUCTIONS
+# LOAD CURRENT AUCTIONS
 # =========================
 @st.cache_data(ttl=300)
-def load_item_auctions(item_name, realm):
+def load_item_auctions(item_id, realm):
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
 
-    query = """
+    df = pd.read_sql_query("""
         SELECT
-            a.buyout,
-            a.quantity,
-            a.time_left,
-            a.item_id
-        FROM auctions a
-
-        LEFT JOIN items i
-        ON a.item_id = i.item_id
-
-        WHERE i.name = ?
-        AND a.realm = ?
-
-        ORDER BY a.buyout ASC
-    """
-
-    df = pd.read_sql_query(
-        query,
-        conn,
-        params=(item_name, realm)
-    )
+            buyout,
+            quantity,
+            time_left,
+            item_id
+        FROM current_auctions
+        WHERE item_id = %s
+        AND realm = %s
+        ORDER BY buyout ASC
+        LIMIT 5000
+    """, conn, params=(item_id, realm))
 
     conn.close()
 
@@ -159,24 +213,19 @@ def load_item_auctions(item_name, realm):
 @st.cache_data(ttl=300)
 def load_price_history(item_id, realm):
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
 
-    query = """
+    df = pd.read_sql_query("""
         SELECT
             avg_price,
             quantity,
             ts
         FROM price_history
-        WHERE item_id = ?
-        AND realm = ?
+        WHERE item_id = %s
+        AND realm = %s
         ORDER BY ts ASC
-    """
-
-    df = pd.read_sql_query(
-        query,
-        conn,
-        params=(item_id, realm)
-    )
+        LIMIT 500
+    """, conn, params=(item_id, realm))
 
     conn.close()
 
@@ -187,38 +236,26 @@ def load_price_history(item_id, realm):
 # LOAD CROSS REALM
 # =========================
 @st.cache_data(ttl=300)
-def load_cross_realm(item_name):
+def load_cross_realm(item_id):
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
 
-    query = """
+    df = pd.read_sql_query("""
         SELECT
-            a.realm,
-            MIN(a.buyout) as lowest_price
-
-        FROM auctions a
-
-        LEFT JOIN items i
-        ON a.item_id = i.item_id
-
-        WHERE i.name = ?
-
-        GROUP BY a.realm
-    """
-
-    df = pd.read_sql_query(
-        query,
-        conn,
-        params=(item_name,)
-    )
+            realm,
+            MIN(buyout) / 10000.0 AS lowest_price
+        FROM current_auctions
+        WHERE item_id = %s
+        GROUP BY realm
+        ORDER BY lowest_price ASC
+    """, conn, params=(item_id,))
 
     conn.close()
 
     if not df.empty:
-
-        df["lowest_price"] = (
-            df["lowest_price"] / 10000
-        ).round(2)
+        df["lowest_price"] = df[
+            "lowest_price"
+        ].round(2)
 
     return df
 
@@ -230,40 +267,59 @@ st.sidebar.header("Filters")
 
 realms = load_realms()
 
+if not realms:
+    st.warning("No auction data yet. Run the PostgreSQL import first.")
+    st.stop()
+
 selected_realm = st.sidebar.selectbox(
     "Realm",
     realms
 )
 
-items = load_items_for_realm(
+items_df = load_items_for_realm(
     selected_realm
 )
 
-selected_item = st.sidebar.selectbox(
+if items_df.empty:
+    st.warning("No items found for this realm.")
+    st.stop()
+
+selected_display = st.sidebar.selectbox(
     "Item",
-    items
+    items_df["display_name"].tolist()
 )
+
+selected_rows = items_df[
+    items_df["display_name"] == selected_display
+]
+
+if selected_rows.empty:
+    st.warning("No item selected.")
+    st.stop()
+
+selected_item_id = int(
+    selected_rows["item_id"].iloc[0]
+)
+
+selected_item = selected_display
 
 
 # =========================
-# LOAD ITEM DATA
+# LOAD DATA
 # =========================
 item_df = load_item_auctions(
-    selected_item,
+    selected_item_id,
     selected_realm
 )
 
+history = load_price_history(
+    selected_item_id,
+    selected_realm
+)
 
-# =========================
-# GET ITEM ID
-# =========================
-selected_item_id = None
-
-if not item_df.empty:
-
-    selected_item_id = int(
-        item_df["item_id"].iloc[0]
-    )
+cross = load_cross_realm(
+    selected_item_id
+)
 
 
 # =========================
@@ -346,66 +402,60 @@ else:
 # =========================
 st.subheader("📈 Price History")
 
-if selected_item_id:
+if not history.empty:
 
-    history = load_price_history(
-        selected_item_id,
-        selected_realm
+    history["avg_price"] = history[
+        "avg_price"
+    ].astype(float).round(2)
+
+    history["ts"] = pd.to_datetime(
+        history["ts"],
+        errors="coerce"
     )
 
-    if not history.empty:
+    history = history.dropna(
+        subset=["ts"]
+    )
 
-        history["avg_price"] = history[
-            "avg_price"
-        ].round(2)
+    history["time"] = history[
+        "ts"
+    ].dt.strftime("%d/%m %H:%M")
 
-        history["ts"] = pd.to_datetime(
-            history["ts"]
-        )
+    fig = px.line(
+        history,
+        x="time",
+        y="avg_price",
+        markers=True,
+        text="avg_price"
+    )
 
-        history["time"] = history[
-            "ts"
-        ].dt.strftime("%d/%m %H:%M")
+    fig.update_traces(
+        texttemplate="%{text:.2f}",
+        textposition="top center",
+        hovertemplate=
+        "Price: %{y:.2f}g<br>Time: %{x}<extra></extra>"
+    )
 
-        fig = px.line(
-            history,
-            x="time",
-            y="avg_price",
-            markers=True,
-            text="avg_price"
-        )
+    fig.update_layout(
+        xaxis_title="Time",
+        yaxis_title="Price (g)",
+        height=500
+    )
 
-        fig.update_traces(
-            texttemplate="%{text:.2f}",
-            textposition="top center"
-        )
+    st.plotly_chart(
+        fig,
+        use_container_width=True
+    )
 
-        fig.update_layout(
-            xaxis_title="Time",
-            yaxis_title="Price (g)",
-            height=500
-        )
+else:
 
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-    else:
-
-        st.warning(
-            "No history yet."
-        )
+    st.warning("No history yet.")
 
 
 # =========================
 # CROSS REALM
 # =========================
 st.subheader("🌍 Cross Realm Prices")
-
-cross = load_cross_realm(
-    selected_item
-)
 
 if not cross.empty:
 
@@ -419,9 +469,6 @@ if not cross.empty:
         use_container_width=True
     )
 
-    # =========================
-    # ARBITRAGE
-    # =========================
     if len(cross) >= 2:
 
         cheapest = cross.sort_values(
@@ -465,9 +512,7 @@ Spread:
 
 else:
 
-    st.warning(
-        "No cross realm data."
-    )
+    st.warning("No cross realm data.")
 
 
 # =========================
@@ -482,22 +527,9 @@ col1.metric(
     len(item_df)
 )
 
-if selected_item_id:
-
-    history_count = len(
-        load_price_history(
-            selected_item_id,
-            selected_realm
-        )
-    )
-
-else:
-
-    history_count = 0
-
 col2.metric(
     "History Points",
-    history_count
+    len(history)
 )
 
 col3.metric(
